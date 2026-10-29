@@ -25,9 +25,10 @@ namespace Mobratil.Collections;
 /// observe a half-completed deletion help finish it (the classic "helping" pattern),
 /// so the structure as a whole always makes progress.
 ///
-/// Linearizability: every public operation has a single linearization point — the
-/// successful CAS that publishes its effect (or the volatile read of the value field
-/// for lookups). Concurrent readers never block writers and vice-versa.
+/// Linearizability: point operations have a single linearization point — the
+/// successful CAS that publishes their effect (or the volatile read of the value field
+/// for lookups). Concurrent readers never block writers and vice-versa. As in Java's
+/// CSLM, TryRemoveFirst/TryRemoveLast and Clear are the exceptions (see docs/CONCURRENCY.md).
 /// </summary>
 public sealed class ConcurrentSkipListDictionary<TKey, TValue>
     : IDictionary<TKey, TValue>, IReadOnlyDictionary<TKey, TValue>
@@ -37,6 +38,8 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
     private static readonly object BaseHeader = new();
 
     private readonly IComparer<TKey> _comparer;
+    // Comparer<TKey>.Default on a value-type key: compare through the static so the JIT devirtualizes/inlines it.
+    private readonly bool _defaultCmp;
 
     // The current top-left index node. Volatile: grows as the structure gets taller.
     private volatile HeadIndex _head;
@@ -52,6 +55,7 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
     public ConcurrentSkipListDictionary(IComparer<TKey> comparer)
     {
         _comparer = comparer ?? throw new ArgumentNullException(nameof(comparer));
+        _defaultCmp = typeof(TKey).IsValueType && ReferenceEquals(comparer, Comparer<TKey>.Default);
         // Base header node: key is irrelevant, value == BaseHeader sentinel.
         var baseNode = new Node(default!, BaseHeader, null);
         _head = new HeadIndex(baseNode, null, null, 1);
@@ -65,17 +69,23 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
     //  wrapped in a tiny ValueHolder (the holder reference is the CAS unit; TValue
     //  lives un-boxed in a typed field).  *Reference-type* values need no wrapper at
     //  all — the reference IS already a CAS-able object, so we store it directly and
-    //  save one allocation per put.  (Like Java's CSLM, null values are then rejected,
-    //  because null is the "deleted" sentinel.)  The choice is a per-instantiation
-    //  constant, so the JIT keeps only the relevant branch.
+    //  save one allocation per put.  A null reference value is stored as the private
+    //  NullValue sentinel (null itself is the "deleted" state), so — unlike Java's
+    //  CSLM — null values are supported, as for any IDictionary.  The choice is a
+    //  per-instantiation constant, so the JIT keeps only the relevant branch.
     // ---------------------------------------------------------------------
     private static readonly bool StoreInline = !typeof(TValue).IsValueType;
+    private static readonly object NullValue = new();
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static object Box(TValue value) => StoreInline ? value! : new ValueHolder(value);
+    private static object Box(TValue value) => StoreInline ? (object?)value ?? NullValue : new ValueHolder(value);
 
+    // Cells are created only by Box, so their runtime type is known: skip the checked casts.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static TValue Unbox(object cell) => StoreInline ? (TValue)cell : ((ValueHolder)cell).Value;
+    private static TValue Unbox(object cell)
+        => StoreInline
+            ? (ReferenceEquals(cell, NullValue) ? default! : Unsafe.As<object, TValue>(ref cell))
+            : Unsafe.As<ValueHolder>(cell).Value;
 
     private sealed class ValueHolder
     {
@@ -199,7 +209,8 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
         => ReferenceEquals(Interlocked.CompareExchange(ref _head, update, expect), expect);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private int Compare(TKey a, TKey b) => _comparer.Compare(a, b);
+    private int Compare(TKey a, TKey b)
+        => typeof(TKey).IsValueType && _defaultCmp ? Comparer<TKey>.Default.Compare(a, b) : _comparer.Compare(a, b);
 
     // =====================================================================
     //  Core traversal
@@ -312,7 +323,6 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
     private bool DoPut(TKey key, TValue value, bool onlyIfAbsent, out TValue previous)
     {
         if (key == null) throw new ArgumentNullException(nameof(key));
-        if (StoreInline && value is null) throw new ArgumentNullException(nameof(value), "Null values are not supported.");
         object? newCell = null;  // the value cell, allocated lazily at the commit point only
         Node z;
         for (; ; ) // outer
@@ -571,7 +581,6 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
     private bool DoReplace(TKey key, TValue newValue, TValue comparison)
     {
         if (key == null) throw new ArgumentNullException(nameof(key));
-        if (StoreInline && newValue is null) throw new ArgumentNullException(nameof(newValue), "Null values are not supported.");
         object? newCell = null;  // allocated lazily, only once we've matched
         for (; ; )
         {
@@ -745,18 +754,44 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
     public bool IsEmpty => FindFirst() == null;
 
     /// <summary>
-    /// Atomically resets the dictionary to empty by swapping in a fresh, empty index head.
-    /// Linearizes at the swap: every mapping that existed before the swap is gone
-    /// afterwards. In-flight operations that already captured the old head complete
-    /// against the now-detached structure (which is harmless and GC-reclaimed).
-    /// Matches the spirit of ConcurrentSkipListMap.clear().
+    /// Removes every mapping that is present when <c>Clear</c> is called. Like
+    /// <c>java.util.concurrent.ConcurrentSkipListMap.clear()</c> it deletes entries one at a time through the
+    /// ordinary (linearizable, exactly-once) deletion protocol, so it is O(n) and not atomic as a whole: a
+    /// mapping inserted concurrently may or may not survive. It makes a single ascending pass bounded by the
+    /// largest key present at the start, so it terminates even under a steady stream of concurrent inserts.
+    /// (It deliberately does NOT swap in a fresh head: an in-flight insert could then splice its index tower —
+    /// and with it the detached old list — into the new structure, resurrecting cleared keys, and in-flight
+    /// writers would skew <see cref="Count"/> permanently.)
     /// </summary>
     public void Clear()
     {
-        var baseNode = new Node(default!, BaseHeader, null);
-        var fresh = new HeadIndex(baseNode, null, null, 1);
-        Interlocked.Exchange(ref _head, fresh);
-        _count.Set(0);                               // quiescent reset (Clear is not linearizable vs concurrent writers)
+        Node? last = FindLast();
+        if (last == null) return;
+        TKey hi = last.Key;                           // nothing beyond this existed when we started
+        bool haveCursor = false;
+        TKey cursor = default!;                       // key of the last node we deleted (pass is ascending)
+        Node header = _head.BaseNode;                 // the base header is permanent (never replaced)
+        Node b = header;
+        for (; ; )
+        {
+            Node? n = Volatile.Read(ref b.Next);
+            if (n == null) break;
+            Node? f = Volatile.Read(ref n.Next);
+            if (!ReferenceEquals(n, Volatile.Read(ref b.Next))) continue;
+            object? v = Volatile.Read(ref n.Value);
+            if (v == null) { n.HelpDelete(b, f); continue; }
+            if (ReferenceEquals(v, n) || Volatile.Read(ref b.Value) == null) { b = header; continue; }  // b deleted under us
+            if (haveCursor && Compare(n.Key, cursor) <= 0) { b = n; continue; }   // inserted behind the cursor: keep
+            if (Compare(n.Key, hi) > 0) break;
+            if (!n.CasValue(v, null)) continue;
+            _count.Decrement();                       // exactly-once: only one thread wins the value->null CAS
+            cursor = n.Key; haveCursor = true;
+            if (!n.AppendMarker(f) || !b.CasNext(n, f)) FindNode(n.Key);
+        }
+        // The indexed nodes are (almost all) deleted now: drop the index levels wholesale rather than leaving
+        // thousands of dead entries for later traversals to unlink one by one. Losing a live node's index
+        // entry (a concurrent insert, or a survivor) only costs search speed, never correctness.
+        for (Index? q = _head; q != null; q = q.Down) Volatile.Write(ref q.Right, null);
     }
 
     /// <summary>Count of live mappings via the striped counter — O(stripes), not O(n). Weakly consistent
@@ -768,14 +803,14 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
 
     public bool TryGetFirst(out KeyValuePair<TKey, TValue> entry)
     {
-        Node? n = FindFirst();
-        while (n != null)
+        // If the first node is deleted under us, start over from the head: walking forward to its
+        // successor could return a key that was never the minimum (a smaller one may have been inserted).
+        for (; ; )
         {
+            Node? n = FindFirst();
+            if (n == null) { entry = default; return false; }
             if (n.TryGetValidValue(out var v)) { entry = new(n.Key, v); return true; }
-            n = NextLiveNode(n);
         }
-        entry = default;
-        return false;
     }
 
     public bool TryGetLast(out KeyValuePair<TKey, TValue> entry)
@@ -965,13 +1000,17 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
         {
             Node? n = FindLast();
             if (n == null) { entry = default; return false; }
-            if (n.TryGetValidValue(out var v) &&
-                DoRemove(n.Key, hasExpected: true, v, out _))
-            {
-                entry = new KeyValuePair<TKey, TValue>(n.Key, v);
-                return true;
-            }
-            // last entry changed/removed under us — retry
+            object? v = Volatile.Read(ref n.Value);
+            if (v == null || ReferenceEquals(v, n) || ReferenceEquals(v, BaseHeader)) continue;
+            // Still the last node? (Re-checked right before the claiming CAS, like Lea's doRemoveLastEntry, rather
+            // than via a separate keyed remove, which left a wide window for a larger key to be inserted.)
+            if (Volatile.Read(ref n.Next) != null) continue;
+            if (!n.CasValue(v, null)) continue;
+            _count.Decrement();                       // exactly-once: only one thread wins the value->null CAS
+            FindNode(n.Key);                          // help unlink n (marker + splice) and prune its index
+            if (Volatile.Read(ref _head.Right) == null) TryReduceLevel();
+            entry = new KeyValuePair<TKey, TValue>(n.Key, Unbox(v));
+            return true;
         }
     }
 
@@ -1102,15 +1141,34 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
         {
             private readonly RangeView _view;
             private KeyValuePair<TKey, TValue> _current;
+            private Node? _node;
             private bool _started, _done;
 
-            internal Enumerator(RangeView view) { _view = view; _current = default; _started = false; _done = false; }
+            internal Enumerator(RangeView view) { _view = view; _current = default; _node = null; _started = false; _done = false; }
 
             public bool MoveNext()
             {
                 if (_done) return false;
-                // TryGetFirst / TryGetHigher are defined in *view order*, so a single
-                // pair of calls walks the view ascending or descending alike.
+                var p = _view._p;
+                if (!_view._desc)
+                {
+                    // Ascending: locate the lower bound once, then walk the base level like the parent's
+                    // enumerator — O(1) per element instead of a fresh O(log n) search for each one.
+                    Node? n = _started ? p.NextLiveNode(_node!)
+                            : _view._hasLo ? p.FindNear(_view._lo, _view._loInc ? RelEq : 0) : p.FindFirst();
+                    _started = true;
+                    for (; n != null; n = p.NextLiveNode(n))
+                    {
+                        if (!n.TryGetValidValue(out var v)) continue;
+                        if (_view.TooHigh(n.Key)) break;
+                        _node = n;
+                        _current = new KeyValuePair<TKey, TValue>(n.Key, v);
+                        return true;
+                    }
+                    _done = true; _node = null; _current = default;
+                    return false;
+                }
+                // Descending: the base list is singly linked, so step with a relational search (in view order).
                 bool ok = _started ? _view.TryGetHigher(_current.Key, out _current) : _view.TryGetFirst(out _current);
                 _started = true;
                 if (!ok) { _done = true; _current = default; return false; }
@@ -1119,7 +1177,7 @@ public sealed class ConcurrentSkipListDictionary<TKey, TValue>
 
             public readonly KeyValuePair<TKey, TValue> Current => _current;
             readonly object IEnumerator.Current => _current;
-            public void Reset() { _started = false; _done = false; _current = default; }
+            public void Reset() { _started = false; _done = false; _node = null; _current = default; }
             public readonly void Dispose() { }
         }
 

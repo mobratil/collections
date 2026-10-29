@@ -42,7 +42,8 @@ foreach (var kv in map.Reverse()) { }            // whole map, descending
 Point operations (get/add/remove, the indexer, `GetOrAdd`/`AddOrUpdate`, and the navigable lookups) are
 **linearizable**. Enumeration and range views are **weakly consistent** — never throw on concurrent
 mutation, always sorted, but not a point-in-time snapshot (like `ConcurrentDictionary`'s enumerator).
-`Count` is weakly consistent and non-negative. Details:
+`Count` is weakly consistent and non-negative (exact once quiescent). Values may be `null`. A throwing
+comparer surfaces its exception and leaves the map intact. Details:
 [docs/CONCURRENCY.md](https://github.com/mobratil/collections/blob/main/docs/CONCURRENCY.md).
 
 ## Correctness

@@ -86,14 +86,25 @@ public class AllocationTests
     }
 
     [Fact]
-    public void Null_Values_Are_Rejected_For_Reference_Types()
+    public void Null_Values_Are_Supported_For_Reference_Types()
     {
-        var d = new ConcurrentSkipListDictionary<int, string>();
-        Assert.Throws<ArgumentNullException>(() => d[1] = null!);
-        Assert.Throws<ArgumentNullException>(() => d.TryAdd(1, null!));
-        Assert.Throws<ArgumentNullException>(() => d.Add(1, null!));
-        d[1] = "ok";
-        Assert.Throws<ArgumentNullException>(() => d.TryUpdate(1, null!, "ok"));
+        // docs/CONCURRENCY.md: "Values may be any type, including reference types and null." The inline
+        // (no-holder) storage maps null onto a private sentinel, since null itself means "deleted".
+        var d = new ConcurrentSkipListDictionary<int, string?>();
+        d[1] = null;
+        Assert.True(d.TryGetValue(1, out var s) && s is null);
+        Assert.True(d.ContainsKey(1));
+        Assert.False(d.TryAdd(1, "x"));
+        Assert.True(d.ContainsValue(null));
+        Assert.True(d.TryUpdate(1, "ok", null));
+        Assert.Equal("ok", d[1]);
+        Assert.True(d.TryUpdate(1, null, "ok"));
+        Assert.True(d.TryRemove(new KeyValuePair<int, string?>(1, null)));
+        Assert.False(d.ContainsKey(1));
+        Assert.True(d.TryAdd(2, null));
+        Assert.Null(d.GetOrAdd(2, "y"));
+        Assert.True(d.TryRemoveFirst(out var e) && e.Key == 2 && e.Value is null);
+        Assert.Equal(0, d.Count);
         // Nullable value types are value types -> holder path -> null is a normal value.
         var nd = new ConcurrentSkipListDictionary<int, int?>();
         nd[1] = null;
