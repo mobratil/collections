@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Soak" />
+    <InternalsVisibleTo Include="LockFreeSkipList.Tests" />
   </ItemGroup>
 
 </Project>

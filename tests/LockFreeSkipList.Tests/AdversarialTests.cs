@@ -303,6 +303,54 @@ public class AdversarialTests
     }
 
     // ------------------------------------------------------------------------------------------------
+    //  TryRemoveLast racing a split (deterministic, via an internal test seam). SplitLeaf publishes the new
+    //  right leaf through oldNext.Prev before the parent links it. A poller walking Prev from an empty right
+    //  neighbour reached that leaf and emptied it, and the split then installed default(TKey) as the
+    //  separator: keys stayed enumerable but point lookups lost them, and Validate() failed.
+    //  (Scenario found by an independent code review.)
+    // ------------------------------------------------------------------------------------------------
+    [Fact]
+    public void Poll_Last_Cannot_Touch_A_Split_Leaf_Before_Its_Parent_Links_It()
+    {
+        var d = new ConcurrentBTreeDictionary<int, int>(3);
+        for (int k = 10; k <= 160; k += 10) d[k] = k;
+        d[71] = 71; d[72] = 72;
+        foreach (var k in new[] { 130, 140, 150, 160, 70, 71 }) Assert.True(d.TryRemove(k, out _));
+        d[111] = 111;
+
+        using var paused = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        int fired = 0;
+        d.SplitPublishedHook = () =>
+        {
+            if (Interlocked.Exchange(ref fired, 1) != 0) return;
+            paused.Set();
+            resume.Wait(TimeSpan.FromSeconds(30));
+        };
+        var insert = Task.Run(() => d.TryAdd(112, 112));
+        Assert.True(paused.Wait(TimeSpan.FromSeconds(30)), "split hook never fired");
+
+        // While the split is paused, poll the end of the tree. A correct implementation may have to wait
+        // for the split to finish (the new leaf is locked); it must never modify that leaf.
+        var polls = Task.Run(() =>
+        {
+            d.TryRemoveLast(out var a);
+            d.TryRemoveLast(out var b);
+            return (a.Key, b.Key);
+        });
+        polls.Wait(TimeSpan.FromMilliseconds(300));
+        resume.Set();
+        Assert.True(insert.Wait(TimeSpan.FromSeconds(30)) && insert.Result);
+        Assert.True(polls.Wait(TimeSpan.FromSeconds(30)), "polls did not finish after the split completed");
+        d.SplitPublishedHook = null;
+
+        d.Validate();
+        foreach (var kv in d)
+            Assert.True(d.TryGetValue(kv.Key, out var v) && v == kv.Value, $"key {kv.Key} enumerable but not found by lookup");
+        Assert.Equal(d.Count, d.Keys.Count);
+    }
+
+    // ------------------------------------------------------------------------------------------------
     //  Clear() racing writers. (1) Once quiescent, Count must equal the keys actually present — both
     //  structures let in-flight writers skew the counter permanently. (2) A key whose TryAdd completed
     //  before Clear() was invoked (and is never re-added) must never be observed after Clear() returns —
