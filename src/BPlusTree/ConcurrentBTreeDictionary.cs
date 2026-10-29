@@ -169,6 +169,9 @@ public sealed class ConcurrentBTreeDictionary<TKey, TValue>
     private volatile Node _root;
     private volatile StripedCounter _count = new();   // counter of the CURRENT generation (see Leaf.Counter)
     private readonly object _clearGate = new();
+#pragma warning disable CS0649   // assigned only by tests (InternalsVisibleTo) in the dev build
+    internal Action? SplitPublishedHook;   // test-only: runs inside SplitLeaf once `right` is reachable via oldNext.Prev
+#pragma warning restore CS0649
     internal long _splits, _merges;   // diagnostic counters (leaf split / leaf merge) — read by the soak harness
     internal (long splits, long merges) RebalanceCounts => (Volatile.Read(ref _splits), Volatile.Read(ref _merges));
 
@@ -488,8 +491,9 @@ public sealed class ConcurrentBTreeDictionary<TKey, TValue>
             return false;
         }
         InsertIntoLeaf(leaf, ~idx, key, value);
-        SplitLeaf(leaf, out TKey sep, out Node right);
+        SplitLeaf(leaf, out TKey sep, out Leaf right);
         InsertIntoInternal(parent, ci, sep, right);
+        right.WriteUnlock();                             // linked into the parent: now safe to expose
         leaf.WriteUnlock();
         parent.WriteUnlock();
         leaf.Counter.Increment();
@@ -534,8 +538,9 @@ public sealed class ConcurrentBTreeDictionary<TKey, TValue>
                 added = true;
                 if (leaf.Count > _max)
                 {
-                    SplitLeaf(leaf, out TKey sep, out Node right);
+                    SplitLeaf(leaf, out TKey sep, out Leaf right);
                     Propagate(path, sep, right);
+                    right.WriteUnlock();                 // linked into the tree: now safe to expose
                 }
             }
 
@@ -590,15 +595,20 @@ public sealed class ConcurrentBTreeDictionary<TKey, TValue>
         n.Count++;
     }
 
-    private void SplitLeaf(Leaf leaf, out TKey sep, out Node rightNode)
+    // The new right leaf is returned WRITE-LOCKED: it becomes reachable through the leaf chain
+    // (oldNext.Prev / leaf.Next) before the parent links it, and chain walkers (TryRemoveLast, scans)
+    // must not touch it until the separator is in the parent. The caller unlocks it after linking.
+    private void SplitLeaf(Leaf leaf, out TKey sep, out Leaf rightNode)
     {
         Interlocked.Increment(ref _splits);
         int mid = (_max + 1) / 2;
         int rc = leaf.Count - mid;
         var right = NewLeaf(leaf.Counter);
+        right.Version = 1;                               // born locked (nobody else can hold it yet)
         Array.Copy(leaf.Keys, mid, right.Keys, 0, rc);
         Array.Copy(leaf.Values, mid, right.Values, 0, rc);
         right.Count = rc;
+        sep = right.Keys[0];                             // capture before the leaf is published
         // Splice `right` between `leaf` and its old right sibling, fixing the doubly-linked chain.
         // `leaf` is already write-locked (held). We briefly lock the old right sibling to fix its Prev;
         // sibling locks are always acquired left→right, so this can't deadlock with the top-down latches.
@@ -606,11 +616,11 @@ public sealed class ConcurrentBTreeDictionary<TKey, TValue>
         right.Prev = leaf;
         right.Next = oldNext;
         if (oldNext != null) { oldNext.WriteLock(); oldNext.Prev = right; oldNext.WriteUnlock(); }
+        SplitPublishedHook?.Invoke();                    // test seam: pause with `right` reachable via the chain
         leaf.Next = right;                               // publish in the forward chain last
         leaf.Count = mid;
         Array.Clear(leaf.Keys, mid, rc);
         Array.Clear(leaf.Values, mid, rc);
-        sep = right.Keys[0];
         rightNode = right;
     }
 
