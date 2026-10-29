@@ -17,7 +17,7 @@
 
     <!-- Package metadata -->
     <PackageId>Mobratil.Collections</PackageId>
-    <Version>0.1.1</Version>
+    <Version>0.2.0</Version>
     <Authors>Martin Obrátil</Authors>
     <Description>Thread-safe, sorted, navigable dictionaries for .NET: a lock-free skip list (ConcurrentSkipListDictionary, a port of Doug Lea's ConcurrentSkipListMap) and an optimistic-lock-coupling B+ tree (ConcurrentBTreeDictionary). Linearizable point operations, weakly-consistent range views (GetViewBetween / Reverse) and navigable lookups (Ceiling/Floor/Higher/Lower). Validated on x64 and arm64.</Description>
     <PackageTags>concurrent;thread-safe;lock-free;concurrent-btree;b-tree;btree;concurrent-skiplist;skip-list;skiplist;sorted;navigable;dictionary;collections;ordered;concurrentdictionary</PackageTags>
